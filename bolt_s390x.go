@@ -1,4 +1,4 @@
-// +build arm64
+// +build s390x
 
 package bolt
 

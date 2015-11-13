@@ -1,4 +1,4 @@
-// +build arm64
+// +build ppc64le
 
 package bolt
 
