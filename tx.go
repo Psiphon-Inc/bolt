@@ -336,6 +336,21 @@ func (tx *Tx) Check() <-chan error {
 	return ch
 }
 
+// [Psiphon]
+// SynchronousCheck performs the Check function in the current goroutine and recovers
+// from any panics, such as the panic in Cursor.search().
+func (tx *Tx) SynchronousCheck() (reterr error) {
+	defer func() {
+		if e := recover(); e != nil {
+			reterr = fmt.Errorf("SynchronousCheck panic: %s", e)
+		}
+	}()
+	ch := make(chan error)
+	tx.check(ch)
+	reterr = <-ch
+	return
+}
+
 func (tx *Tx) check(ch chan error) {
 	// Check if any pages are double freed.
 	freed := make(map[pgid]bool)
