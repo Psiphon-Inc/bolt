@@ -62,6 +62,10 @@ func TestTx_Commit_ErrTxNotWritable(t *testing.T) {
 	if err := tx.Commit(); err != bolt.ErrTxNotWritable {
 		t.Fatal(err)
 	}
+	// [Psiphon]
+	// https://github.com/etcd-io/bbolt/commit/e06ec0a754bc30c2e17ad871962e71635bf94d45
+	// Close the view transaction
+	tx.Rollback()
 }
 
 // Ensure that a transaction can retrieve a cursor on the root bucket.
