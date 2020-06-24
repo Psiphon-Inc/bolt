@@ -5,30 +5,31 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"testing"
 
-	"github.com/boltdb/bolt"
+	"github.com/Psiphon-Labs/bolt"
 )
 
-func TestSimulate_1op_1p(t *testing.T)     { testSimulate(t, 1, 1) }
-func TestSimulate_10op_1p(t *testing.T)    { testSimulate(t, 10, 1) }
-func TestSimulate_100op_1p(t *testing.T)   { testSimulate(t, 100, 1) }
-func TestSimulate_1000op_1p(t *testing.T)  { testSimulate(t, 1000, 1) }
-func TestSimulate_10000op_1p(t *testing.T) { testSimulate(t, 10000, 1) }
+func TestSimulate_1op_1p(t *testing.T)     { testSimulate(t, nil, 1, 1, 1) }
+func TestSimulate_10op_1p(t *testing.T)    { testSimulate(t, nil, 1, 10, 1) }
+func TestSimulate_100op_1p(t *testing.T)   { testSimulate(t, nil, 1, 100, 1) }
+func TestSimulate_1000op_1p(t *testing.T)  { testSimulate(t, nil, 1, 1000, 1) }
+func TestSimulate_10000op_1p(t *testing.T) { testSimulate(t, nil, 1, 10000, 1) }
 
-func TestSimulate_10op_10p(t *testing.T)    { testSimulate(t, 10, 10) }
-func TestSimulate_100op_10p(t *testing.T)   { testSimulate(t, 100, 10) }
-func TestSimulate_1000op_10p(t *testing.T)  { testSimulate(t, 1000, 10) }
-func TestSimulate_10000op_10p(t *testing.T) { testSimulate(t, 10000, 10) }
+func TestSimulate_10op_10p(t *testing.T)    { testSimulate(t, nil, 1, 10, 10) }
+func TestSimulate_100op_10p(t *testing.T)   { testSimulate(t, nil, 1, 100, 10) }
+func TestSimulate_1000op_10p(t *testing.T)  { testSimulate(t, nil, 1, 1000, 10) }
+func TestSimulate_10000op_10p(t *testing.T) { testSimulate(t, nil, 1, 10000, 10) }
 
-func TestSimulate_100op_100p(t *testing.T)   { testSimulate(t, 100, 100) }
-func TestSimulate_1000op_100p(t *testing.T)  { testSimulate(t, 1000, 100) }
-func TestSimulate_10000op_100p(t *testing.T) { testSimulate(t, 10000, 100) }
+func TestSimulate_100op_100p(t *testing.T)   { testSimulate(t, nil, 1, 100, 100) }
+func TestSimulate_1000op_100p(t *testing.T)  { testSimulate(t, nil, 1, 1000, 100) }
+func TestSimulate_10000op_100p(t *testing.T) { testSimulate(t, nil, 1, 10000, 100) }
 
-func TestSimulate_10000op_1000p(t *testing.T) { testSimulate(t, 10000, 1000) }
+func TestSimulate_10000op_1000p(t *testing.T) { testSimulate(t, nil, 1, 10000, 1000) }
 
 // Randomly generate operations on a given database with multiple clients to ensure consistency and thread safety.
-func testSimulate(t *testing.T, threadCount, parallelism int) {
+func testSimulate(t *testing.T, openOption *bolt.Options, round, threadCount, parallelism int) {
 	if testing.Short() {
 		t.Skip("skipping test in short mode.")
 	}
@@ -42,81 +43,112 @@ func testSimulate(t *testing.T, threadCount, parallelism int) {
 	var versions = make(map[int]*QuickDB)
 	versions[1] = NewQuickDB()
 
-	db := MustOpenDB()
+	db := MustOpenWithOption(openOption)
 	defer db.MustClose()
 
 	var mutex sync.Mutex
 
-	// Run n threads in parallel, each with their own operation.
-	var wg sync.WaitGroup
-	var threads = make(chan bool, parallelism)
-	var i int
-	for {
-		threads <- true
-		wg.Add(1)
-		writable := ((rand.Int() % 100) < 20) // 20% writers
+	for n := 0; n < round; n++ {
+		// Run n threads in parallel, each with their own operation.
+		var threads = make(chan bool, parallelism)
+		var wg sync.WaitGroup
 
-		// Choose an operation to execute.
-		var handler simulateHandler
-		if writable {
-			handler = writerHandlers[rand.Intn(len(writerHandlers))]
-		} else {
-			handler = readerHandlers[rand.Intn(len(readerHandlers))]
-		}
+		// counter for how many goroutines were fired
+		var opCount int64
 
-		// Execute a thread for the given operation.
-		go func(writable bool, handler simulateHandler) {
-			defer wg.Done()
+		// counter for ignored operations
+		var igCount int64
 
-			// Start transaction.
-			tx, err := db.Begin(writable)
-			if err != nil {
-				t.Fatal("tx begin: ", err)
-			}
+		var errCh = make(chan error, threadCount)
 
-			// Obtain current state of the dataset.
-			mutex.Lock()
-			var qdb = versions[tx.ID()]
+		var i int
+		for {
+			// this buffered channel will keep accepting booleans
+			// until it hits the limit defined by the parallelism
+			// argument to testSimulate()
+			threads <- true
+
+			// this wait group can only be marked "done" from inside
+			// the subsequent goroutine
+			wg.Add(1)
+			writable := ((rand.Int() % 100) < 20) // 20% writers
+
+			// Choose an operation to execute.
+			var handler simulateHandler
 			if writable {
-				qdb = versions[tx.ID()-1].Copy()
-			}
-			mutex.Unlock()
-
-			// Make sure we commit/rollback the tx at the end and update the state.
-			if writable {
-				defer func() {
-					mutex.Lock()
-					versions[tx.ID()] = qdb
-					mutex.Unlock()
-
-					if err := tx.Commit(); err != nil {
-						t.Fatal(err)
-					}
-				}()
+				handler = writerHandlers[rand.Intn(len(writerHandlers))]
 			} else {
-				defer func() { _ = tx.Rollback() }()
+				handler = readerHandlers[rand.Intn(len(readerHandlers))]
 			}
 
-			// Ignore operation if we don't have data yet.
-			if qdb == nil {
-				return
+			// Execute a thread for the given operation.
+			go func(writable bool, handler simulateHandler) {
+				defer wg.Done()
+				atomic.AddInt64(&opCount, 1)
+				// Start transaction.
+				tx, err := db.Begin(writable)
+				if err != nil {
+					errCh <- fmt.Errorf("error tx begin: %v", err)
+					return
+				}
+
+				// Obtain current state of the dataset.
+				mutex.Lock()
+				var qdb = versions[tx.ID()]
+				if writable {
+					qdb = versions[tx.ID()-1].Copy()
+				}
+				mutex.Unlock()
+
+				// Make sure we commit/rollback the tx at the end and update the state.
+				if writable {
+					defer func() {
+						mutex.Lock()
+						versions[tx.ID()] = qdb
+						mutex.Unlock()
+
+						if err := tx.Commit(); err != nil {
+							errCh <- err
+							return
+						}
+					}()
+				} else {
+					defer func() { _ = tx.Rollback() }()
+				}
+
+				// Ignore operation if we don't have data yet.
+				if qdb == nil {
+					atomic.AddInt64(&igCount, 1)
+					return
+				}
+
+				// Execute handler.
+				handler(tx, qdb)
+
+				// Release a thread back to the scheduling loop.
+				<-threads
+			}(writable, handler)
+
+			i++
+			if i >= threadCount {
+				break
 			}
-
-			// Execute handler.
-			handler(tx, qdb)
-
-			// Release a thread back to the scheduling loop.
-			<-threads
-		}(writable, handler)
-
-		i++
-		if i > threadCount {
-			break
 		}
+
+		// Wait until all threads are done.
+		wg.Wait()
+		t.Logf("transactions:%d ignored:%d", opCount, igCount)
+		close(errCh)
+		for err := range errCh {
+			if err != nil {
+				t.Fatalf("error from inside goroutine: %v", err)
+			}
+		}
+
+		db.MustClose()
+		db.MustReopen()
 	}
 
-	// Wait until all threads are done.
-	wg.Wait()
 }
 
 type simulateHandler func(tx *bolt.Tx, qdb *QuickDB)
